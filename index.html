@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MediaPipe Hand Landmarks 실시간 와이어프레임</title>
+  <style>
+    :root { color-scheme: dark; --bg:#10141b; --panel:#191f2a; --line:#2b3545; --text:#edf2f7; --muted:#a9b4c4; --accent:#70e1c1; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:1100px; margin:0 auto; padding:24px 18px 40px; }
+    h1 { font-size:clamp(1.35rem,3vw,2rem); margin:0 0 8px; }
+    p { color:var(--muted); margin:8px 0 16px; }
+    .toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:18px 0; }
+    button { border:0; border-radius:9px; padding:10px 16px; background:var(--accent); color:#08231c; font-weight:700; cursor:pointer; }
+    button.secondary { background:#303b4c; color:var(--text); }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .status { color:var(--muted); min-height:1.5em; }
+    .stage { position:relative; width:100%; aspect-ratio:16/9; overflow:hidden; background:#05070a; border:1px solid var(--line); border-radius:14px; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+    video { transform:scaleX(-1); }
+    canvas { pointer-events:none; }
+    .details { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-top:14px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; }
+    .card strong { display:block; margin-bottom:4px; }
+    code { color:#a8f0d9; }
+    .small { font-size:.9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>MediaPipe Hand Landmarks</h1>
+  <p>웹캠 영상에서 손을 찾아 21개 랜드마크와 연결선을 실시간으로 그립니다. 카메라 사용 권한이 필요합니다.</p>
+  <div class="toolbar">
+    <button id="startBtn">카메라 시작</button>
+    <button id="stopBtn" class="secondary" disabled>중지</button>
+    <span id="status" class="status" role="status">시작 버튼을 눌러 주세요.</span>
+  </div>
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div class="details">
+    <div class="card"><strong>인식 상태</strong><span id="hands">아직 실행하지 않았습니다.</span></div>
+    <div class="card"><strong>랜드마크</strong><span>손 하나당 21개 점: 손목, 손가락 관절 및 손끝</span></div>
+    <div class="card"><strong>실행 환경</strong><span class="small">카메라 접근을 위해 <code>localhost</code> 또는 HTTPS에서 실행하세요. HTML 파일을 직접 열면 브라우저에 따라 카메라가 차단될 수 있습니다.</span></div>
+  </div>
+</main>
+<script type="module">
+  import { FilesetResolver, HandLandmarker }
+    from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22";
+
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("overlay");
+  const ctx = canvas.getContext("2d");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const statusEl = document.getElementById("status");
+  const handsEl = document.getElementById("hands");
+
+  let handLandmarker = null;
+  let stream = null;
+  let running = false;
+  let rafId = 0;
+  let lastVideoTime = -1;
+
+  const CONNECTIONS = [
+    [0,1],[1,2],[2,3],[3,4],       // 엄지
+    [0,5],[5,6],[6,7],[7,8],       // 검지
+    [5,9],[9,10],[10,11],[11,12],  // 중지
+    [9,13],[13,14],[14,15],[15,16],// 약지
+    [13,17],[17,18],[18,19],[19,20],// 새끼
+    [0,17]                         // 손바닥 바깥쪽
+  ];
+
+  function resizeCanvas() {
+    const rect = video.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function drawResults(result) {
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+
+    const landmarks = result.landmarks || [];
+    handsEl.textContent = landmarks.length
+      ? `${landmarks.length}개 손 인식 · 손당 21개 랜드마크`
+      : "손을 찾지 못했습니다. 카메라 앞에 손을 보여 주세요.";
+
+    for (const points of landmarks) {
+      // 영상은 CSS로 좌우 반전되어 있으므로 오버레이도 좌우 반전
+      const xy = points.map(p => ({ x: (1 - p.x) * w, y: p.y * h }));
+
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "#70e1c1";
+      for (const [a, b] of CONNECTIONS) {
+        ctx.beginPath();
+        ctx.moveTo(xy[a].x, xy[a].y);
+        ctx.lineTo(xy[b].x, xy[b].y);
+        ctx.stroke();
+      }
+
+      // 손바닥 중심에서 손가락 끝으로 이어지는 주요 선은 조금 더 밝게 표시
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(255,255,255,.85)";
+      for (const [a, b] of [[0,5],[0,9],[0,13],[0,17]]) {
+        ctx.beginPath();
+        ctx.moveTo(xy[a].x, xy[a].y);
+        ctx.lineTo(xy[b].x, xy[b].y);
+        ctx.stroke();
+      }
+
+      points.forEach((p, i) => {
+        const point = xy[i];
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, [4,8,12,16,20].includes(i) ? 5 : 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = [4,8,12,16,20].includes(i) ? "#ffcf70" : "#ffffff";
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "#14202b";
+        ctx.stroke();
+      });
+    }
+  }
+
+  async function predict() {
+    if (!running || !handLandmarker) return;
+    if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      const result = handLandmarker.detectForVideo(video, performance.now());
+      drawResults(result);
+    }
+    rafId = requestAnimationFrame(predict);
+  }
+
+  async function start() {
+    startBtn.disabled = true;
+    statusEl.textContent = "모델을 불러오는 중…";
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("이 브라우저에서 카메라 API를 사용할 수 없습니다. HTTPS 또는 localhost에서 실행해 주세요.");
+      }
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
+      );
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2,
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
+      video.srcObject = stream;
+      await video.play();
+      resizeCanvas();
+      running = true;
+      stopBtn.disabled = false;
+      statusEl.textContent = "실행 중 · 손을 카메라 앞에 보여 주세요.";
+      predict();
+    } catch (error) {
+      console.error(error);
+      statusEl.textContent = `시작하지 못했습니다: ${error.message || error}`;
+      startBtn.disabled = false;
+      if (handLandmarker) { handLandmarker.close(); handLandmarker = null; }
+      if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
+    }
+  }
+
+  function stop() {
+    running = false;
+    cancelAnimationFrame(rafId);
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+    }
+    video.srcObject = null;
+    if (handLandmarker) {
+      handLandmarker.close();
+      handLandmarker = null;
+    }
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    handsEl.textContent = "중지되었습니다.";
+    statusEl.textContent = "카메라가 중지되었습니다.";
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  startBtn.addEventListener("click", start);
+  stopBtn.addEventListener("click", stop);
+  window.addEventListener("resize", resizeCanvas);
+  window.addEventListener("beforeunload", stop);
+</script>
+</body>
+</html>
